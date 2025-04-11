@@ -1,0 +1,1 @@
+/usr/bin/c++  -g   CMakeFiles/server.dir/src/server.cpp.o  -o server   -L/hzoe/recorder/lib  -Wl,-rpath,/hzoe/recorder/lib -lpthread -lhv -lgpiod -lgpiodcxx -lspdlog 

@@ -1,0 +1,3 @@
+/hzoe/recorder/build/CMakeFiles/rebuild_cache.dir
+/hzoe/recorder/build/CMakeFiles/edit_cache.dir
+/hzoe/recorder/build/CMakeFiles/server.dir
