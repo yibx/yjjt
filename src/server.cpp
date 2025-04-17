@@ -2,6 +2,7 @@
 #include <fstream>
 #include <chrono>
 #include <ctime>
+#include <thread>
 // sudo apt install libgpiod2 libgpiod-dev
 // sudo apt install gpiod
 #include <gpiod.hpp>
@@ -28,15 +29,18 @@ std::mutex mux;
 
 // GPIO参数
 const char* chip_name = "gpiochip0";
-const int   signal_1 = 17; 
-const int   signal_2 = 27; 
-const int   signal_3 = 22;  
-const int   signal_4 = 23; 
+const int   signal_1 = 17;  // 中控室主控箱和船端控制箱连接状态异常
+const int   signal_2 = 27;  // 中控室急停
+const int   signal_3 = 22;  // 船端急停
+const int   signal_4 = 23;  // 遥控器模拟报警
+const int   signal_5 = 16;  // 自动手动切换，自动拍停
 // consumer是GPIO引脚的使用者标识符，可以自定义设置。
 const char* consumer = "gpio_alarm";
 
-const int alarm1 = 12;
-const int alarm2 = 6;
+const int alarm1 = 12;  // 中控室灯闪
+const int alarm2 = 6;   // 中控室蜂鸣器报警
+const int alarm3 = 13;  // 自动/手动切换，一键拍停，输出高电平
+const int alarm4 = 26;  // 船端报警，闪灯和蜂鸣器报警
 
 // 定义返回值
 #define SUCCESS 0    
@@ -44,9 +48,15 @@ const int alarm2 = 6;
 bool signal1_open = false;
 bool signal2_open = false;
 bool signal3_open = false;
+bool signal4_open = false;
+bool signal5_open = false;
+
+bool blight = false;
+std::thread light_alarm_thread;
 
 static bool subscribed_ = false; // 此处全部和类局部相同，用来判断是否订阅数据
 
+// 版本号
 #define VERSION_MAJOR 1
 #define VERSION_MINOR 0
 #define VERSION_PATCH 0
@@ -64,6 +74,7 @@ gpiod_chip* chip = nullptr;
 
 gpiod_line* line12 = nullptr;
 gpiod_line* line6 = nullptr;
+gpiod_line* line26 = nullptr;
 
 bool bwarnRecord = false;
 bool bstopRecord = false;
@@ -81,6 +92,27 @@ int request_sql(string type, string status) {
     http_headers headers;
     headers["Content-Type"] = "application/x-www-form-urlencoded";
     auto resp = requests::post("192.168.1.112:9092/stop/record/add", form_data, headers);
+    if (resp == NULL) {
+        spdlog::error("发送POST请求失败");
+        return FAILURE;
+    } else {
+        spdlog::info("请求成功，返回值:{}", resp->body.c_str());
+    }
+    return SUCCESS;
+}
+
+/**
+ * 保存系统状态
+ * 
+ * 停止类型 0：未停止 5：手动遥控器停止 10：控制箱停止 15：船端停止 20：系统自动停止
+ * 急停状态 0：未急停 5：黄色报警 10：已急停
+ */
+int request_pt(string status) {
+    // 定义POST请求的表单数据
+    std::string form_data = std::string("isAutoStop=") + status;
+    http_headers headers;
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    auto resp = requests::post("192.168.1.112:9092/stop/record/autoStop", form_data, headers);
     if (resp == NULL) {
         spdlog::error("发送POST请求失败");
         return FAILURE;
@@ -128,7 +160,37 @@ void write_to_file(const std::string& filename, const std::string& content) {
  * 
  * 注意：gpio引脚同时只能有一个使用，不能同时作为输入和输出
  */
- int set_gpio12_alarm() {
+ int set_gpio_alarm(int alarm_no, int waits) {
+    if (!chip) {
+        chip = gpiod_chip_open_by_name(chip_name);
+        if (!chip) {
+            spdlog::error("Open chip0 failed.");
+            return FAILURE;
+        }
+    }
+    gpiod_line* line_alarm = gpiod_chip_get_line(chip, alarm_no);
+    if (!line_alarm) {
+        spdlog::info("获取GPIO线路失败");
+        return FAILURE;
+    }
+    if (gpiod_line_request_output(line_alarm, consumer, 0) < 0) {
+        spdlog::info("设置GPIO输出模式失败");
+        return FAILURE;
+    }
+
+    gpiod_line_set_value(line_alarm, 1);  // 报警
+    std::this_thread::sleep_for(std::chrono::seconds(waits));
+    gpiod_line_set_value(line_alarm, 0);  // 停止报警
+
+    if (line_alarm) {
+        gpiod_line_release(line_alarm);
+        line_alarm = nullptr;
+    }
+    spdlog::info("报警完成 {} ", alarm_no);
+    return SUCCESS;
+ }
+
+ int open_gpio_light() {
     if (!chip) {
         chip = gpiod_chip_open_by_name(chip_name);
         if (!chip) {
@@ -137,29 +199,34 @@ void write_to_file(const std::string& filename, const std::string& content) {
         }
     }
     if (!line12) {
-        line12 = gpiod_chip_get_line(chip, alarm1);
+        line12 = gpiod_chip_get_line(chip, 12);
         if (!line12) {
             spdlog::info("获取GPIO线路失败");
             return FAILURE;
         }
+        spdlog::info("获取GPIO12线路成功");
     }
     if (gpiod_line_request_output(line12, consumer, 0) < 0) {
         spdlog::info("设置GPIO输出模式失败");
         return FAILURE;
     }
-
-    gpiod_line_set_value(line12, 1);  // 报警
-    std::this_thread::sleep_for(std::chrono::seconds(20));
-    gpiod_line_set_value(line12, 0);  // 停止报警
-
-    if (line12) {
-        gpiod_line_release(line12);
+    blight = true;
+    while (blight)
+    {
+        if (line12) {
+            spdlog::info("灯光闪烁");
+            gpiod_line_set_value(line12, 1);  // 闪灯
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            gpiod_line_set_value(line12, 0);  // 停止闪灯
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
-    spdlog::info("报警完成 {} ", alarm1);
     return SUCCESS;
  }
 
- int set_gpio12_zero() {
+ int close_gpio_light() {
     if (!chip) {
         chip = gpiod_chip_open_by_name(chip_name);
         if (!chip) {
@@ -167,103 +234,126 @@ void write_to_file(const std::string& filename, const std::string& content) {
             return FAILURE;
         }
     }
-    if (!line12) { 
-        line12 = gpiod_chip_get_line(chip, alarm1);
-        if (!line12) {
-            spdlog::info("获取GPIO线路失败");
-            return FAILURE;
-        }
-    }
-    gpiod_line_set_value(line12, 0);  // 停止报警
-
     if (line12) {
+        gpiod_line_set_value(line12, 0);  // 停止报警
         gpiod_line_release(line12);
         line12 = nullptr;
     }
-    spdlog::info("报警解除 {} ", alarm1);
+    spdlog::info("关闭灯光");
     return SUCCESS;
  }
 
- int set_gpio6_alarm() {
-    if (!chip) {
-        chip = gpiod_chip_open_by_name(chip_name);
-        if (!chip) {
-            spdlog::error("Open chip0 failed.");
-            return FAILURE;
-        }
-    }
-    if (!line6) {
-        line6 = gpiod_chip_get_line(chip, alarm2);
-        if (!line6) {
-            spdlog::info("获取GPIO线路失败");
-            return FAILURE;
-        }
-    }
-    if (gpiod_line_request_output(line6, consumer, 0) < 0) {
-        spdlog::info("设置GPIO输出模式失败");
-        return FAILURE;
-    }
-    gpiod_line_set_value(line6, 1);  // 报警
-    std::this_thread::sleep_for(std::chrono::seconds(30));
-    gpiod_line_set_value(line6, 0);  // 停止报警
-    if (line6) {
-        gpiod_line_release(line6);
-        line6 = nullptr;
-    }
-    spdlog::info("报警完成 {} ", alarm2);
-    return SUCCESS;
+int open_fmq_alarm() {
+   if (!chip) {
+       chip = gpiod_chip_open_by_name(chip_name);
+       if (!chip) {
+           spdlog::error("Open chip0 failed.");
+           return FAILURE;
+       }
+   }
+   if (!line6) {
+       line6 = gpiod_chip_get_line(chip, 6);
+       if (!line6) {
+           spdlog::info("获取GPIO线路失败");
+           return FAILURE;
+       }
+       spdlog::info("获取GPIO6线路成功");
+   }
+   if (gpiod_line_request_output(line6, consumer, 0) < 0) {
+       spdlog::info("设置GPIO输出模式失败");
+       return FAILURE;
+   }
+   gpiod_line_set_value(line6, 1);  // 报警
+   spdlog::info("蜂鸣器报警");
+   return SUCCESS;
 }
 
- int set_gpio6_zero() {
-    if (!chip) {
-        chip = gpiod_chip_open_by_name(chip_name);
-        if (!chip) {
-            spdlog::error("Open chip0 failed.");
-            return FAILURE;
-        }
-    }
-    if (!line6) { 
-        line6 = gpiod_chip_get_line(chip, alarm2);
-        if (!line6) {
-            spdlog::info("获取GPIO线路失败");
-            return FAILURE;
-        }
-    }
-    gpiod_line_set_value(line6, 0);  // 停止报警
-
-    if (line6) {
-        gpiod_line_release(line6);
-        line6 = nullptr;
-    }
-    spdlog::info("报警解除 {} ", alarm2);
-    return SUCCESS;
- }
-
-
-void warn_record() {
-    mux.lock();
-    if(SUCCESS != set_gpio12_alarm()) {
-        set_gpio12_alarm();
-    }
-    mux.unlock();
+int close_fmq_alarm() {
+   if (!chip) {
+       chip = gpiod_chip_open_by_name(chip_name);
+       if (!chip) {
+           spdlog::error("Open chip0 failed.");
+           return FAILURE;
+       }
+   }
+   if (line6) {
+       gpiod_line_set_value(line6, 0);  // 停止报警
+       gpiod_line_release(line6);
+       line6 = nullptr;
+   }
+   spdlog::info("关闭蜂鸣器报警");
+   return SUCCESS;
 }
 
-void remove_record() {
-    mux.lock();
-    if(SUCCESS != set_gpio12_zero()) {
-        set_gpio12_zero();
-    }
-    mux.unlock();
+int open_ship_alarm() {
+   if (!chip) {
+       chip = gpiod_chip_open_by_name(chip_name);
+       if (!chip) {
+           spdlog::error("Open chip0 failed.");
+           return FAILURE;
+       }
+   }
+   if (!line26) {
+        line26 = gpiod_chip_get_line(chip, 26);
+       if (!line26) {
+           spdlog::info("获取GPIO线路失败");
+           return FAILURE;
+       }
+       spdlog::info("获取GPIO26线路成功");
+   }
+   if (gpiod_line_request_output(line26, consumer, 0) < 0) {
+       spdlog::info("设置GPIO输出模式失败");
+       return FAILURE;
+   }
+   gpiod_line_set_value(line26, 1);  // 报警
+   spdlog::info("蜂鸣器报警");
+   return SUCCESS;
 }
 
-void stop_record() {
-    mux.lock();
-    if(SUCCESS != set_gpio6_alarm()) {
-        set_gpio6_alarm();
-    }
-    mux.unlock();
+int close_ship_alarm() {
+   if (!chip) {
+       chip = gpiod_chip_open_by_name(chip_name);
+       if (!chip) {
+           spdlog::error("Open chip0 failed.");
+           return FAILURE;
+       }
+   }
+   if (line26) {
+       gpiod_line_set_value(line26, 0);  // 停止报警
+       gpiod_line_release(line26);
+       line26 = nullptr;
+   }
+   spdlog::info("关闭蜂鸣器报警");
+   return SUCCESS;
 }
 
+// 蜂鸣器报警
+void fmq_alarm() {
+    if(SUCCESS != set_gpio_alarm(6, 20)) {
+        set_gpio_alarm(6, 30);
+    }
+}
+
+// 船端报警
+void ship_alarm() {
+    if(SUCCESS != set_gpio_alarm(26, 20)) {
+        set_gpio_alarm(26, 30);
+    }
+}
+
+// 闪灯
+void light_alarm() {
+    if(SUCCESS != set_gpio_alarm(12,20)) {
+        set_gpio_alarm(12, 30);
+    }
+}
+
+// 一键拍停
+void yjpt_alarm() {
+    if(SUCCESS != set_gpio_alarm(13,1)) {
+        set_gpio_alarm(13, 1);
+    }
+}
 
 // mqtt订阅
 class HVMqtt {
@@ -292,8 +382,7 @@ class HVMqtt {
                 spdlog::info("mqtt 连接建立");
                 if (!subscribed_) {
                     mqtt_client_subscribe(cli, "warnRecord", 1);
-                    mqtt_client_subscribe(cli, "stopRecord", 1);
-                    mqtt_client_subscribe(cli, "removeRecord", 1);
+                    mqtt_client_subscribe(cli, "autoStop", 1);
                     subscribed_ = true;  // 标记已订阅
                 }
                 break;
@@ -303,32 +392,28 @@ class HVMqtt {
                 spdlog::info("荷载: {} {}", msg->payload_len, msg->payload);
                 
                 if (std::strstr(msg->topic, "warnRecord") != NULL) {
-                    // 系统监测值异常输出 GPIO12
-                    // 启动GPIO监测
-                    std::thread warn_record_thread(warn_record);
-                    warn_record_thread.detach(); 
-                    
-                    // 处理警告记录
-                    json j = json::parse(msg->payload);
-                    spdlog::info("系统警告记录: {}", j.dump());
-                    
-                    //write_to_file("warnRecord.txt", j.dump());
-                } else if (std::strstr(msg->topic, "stopRecord") != NULL) {
-                    // 云卓遥控急停 GPIO6
-                    std::thread stop_record_thread(stop_record);
-                    stop_record_thread.detach(); 
-                    // 处理停止记录
-                    json j = json::parse(msg->payload);
-                    spdlog::info("云卓遥控急停: {}", j.dump());
-                    //write_to_file("stopRecord.txt", j.dump());
-                } else if (std::strstr(msg->topic, "removeRecord") != NULL) {
-                    // 云卓遥控急停 GPIO6
-                    std::thread remove_record_thread(remove_record);
-                    remove_record_thread.detach(); 
-                    // 处理停止记录
-                    json j = json::parse(msg->payload);
-                    spdlog::info("系统警报解除: {}", j.dump());
-                    //write_to_file("removeRecord.txt", j.dump());
+                    // 系统监测值异常输出 6，26报警
+                    open_fmq_alarm();
+                    spdlog::info("蜂鸣器警告记录");
+                    open_ship_alarm();
+                    spdlog::info("船端警告记录");
+                    if (!light_alarm_thread.joinable()) { 
+                        light_alarm_thread = std::thread(open_gpio_light);
+                        spdlog::info("Light alarm thread started.");
+                    }
+                } else if (std::strstr(msg->topic, "autoStop") != NULL) {
+                    if (SUCCESS != request_sql("20", "10")) {
+                        request_sql("20", "10");
+                    }
+                    open_fmq_alarm();
+                    spdlog::info("蜂鸣器警告记录");
+                    open_ship_alarm();
+                    spdlog::info("船端警告记录");
+                    if (!light_alarm_thread.joinable()) { 
+                        light_alarm_thread = std::thread(open_gpio_light);
+                        spdlog::info("Light alarm thread started.");
+                    }
+                    yjpt_alarm();
                 }
                 break;
             }
@@ -406,6 +491,8 @@ void init_logger() {
  * 网址：
  * https://pinout.xyz/pinout/ground
  */
+
+#if 0
 void get_line_val(const int& signal_number, gpiod_line* line, bool& signal_open) {
     auto val = gpiod_line_get_value(line);
     if (val == 0) {
@@ -429,41 +516,212 @@ void get_line_val(const int& signal_number, gpiod_line* line, bool& signal_open)
         if ((signal_number == 2) && (signal2_open == false)) {
             signal2_open = true;
             spdlog::info("中控室主控箱急停按下 signal {}  open", signal_number);
-            //write_to_file(filename.c_str(), "中控室主控箱急停按下 signal " + std::to_string(signal_number) + " open");
             if(SUCCESS != request_sql("10", "10")) {
                 request_sql("10", "10");
             }
         } else if ((signal_number == 3) && (signal3_open == false)) {
-            // 巡检遥控器按下急停按钮
-            spdlog::info("巡检遥控器按下急停按下 signal {}  open", signal_number);
+            // 船端按下急停按钮
+            spdlog::info("船端按下急停按钮 signal {}  open", signal_number);
             signal3_open = true;
-            //write_to_file(filename.c_str(), "巡检遥控器按下急停按下 signal " + std::to_string(signal_number) + " open");
-            // 不用调用接口
-        } else if (signal_number == 4) {
-            // 预留
+            std::thread light_alarm_thread(light_alarm);
+            light_alarm_thread.detach(); 
+            if(SUCCESS != request_sql("15", "10")) {
+                request_sql("15", "10");
+            }
+        } else if ((signal_number == 4) && (signal4_open == false)) {
+            signal4_open = true;
+            // 中控室复位
+            spdlog::info("中控室复位 signal {}  open", signal_number);
+            if(SUCCESS != request_sql("0", "0")) {
+                request_sql("0", "0");
+            }
         }  else if ((signal_number == 1) && (signal1_open == false)) {
             signal1_open = true;
             spdlog::info("中控室主控箱和船端控制箱连接状态正常 signal {}  open", signal_number);
-            //write_to_file(filename.c_str(), "中控室主控箱和船端控制箱连接状态正常 signal " + std::to_string(signal_number) + " open");
+        } else if ((signal_number == 5) && (signal5_open == false)) {
+            signal5_open = true;
+            yjpt_alarm();
+            spdlog::info("自动拍停开始 signal {}  open", signal_number);
+            if(SUCCESS != request_pt("0")) {
+                request_pt("0");
+            }
         }
     } else {
         // 中控室主控箱和船端控制箱连接状态异常
         if ((signal_number == 1) && (signal1_open == true)) {
             spdlog::error("中控室主控箱和船端控制箱连接状态异常 signal {}  closed", signal_number);
-            //write_to_file(filename.c_str(), "中控室主控箱和船端控制箱连接状态异常 signal " + std::to_string(signal_number) + " closed");
             signal1_open = false;
         } else if ((signal_number == 2) && (signal2_open == true)) {
             spdlog::error("中控室主控箱急停关闭 signal {}  closed", signal_number);
-            //write_to_file(filename.c_str(), "中控室主控箱急停关闭 signal " + std::to_string(signal_number) + " closed");
             signal2_open = false;
         } else if ((signal_number == 3) && (signal3_open == true)) {
-            spdlog::error("巡检遥控器按下急停关闭 signal {}  closed", signal_number);
-            //write_to_file(filename.c_str(), "巡检遥控器按下急停关闭 signal " + std::to_string(signal_number) + " closed");
+            spdlog::error("船端按下急停关闭 signal {}  closed", signal_number);
             signal3_open = false;
+        } else if ((signal_number == 4) && (signal4_open == true)) {
+            spdlog::error("中控室复位关闭 signal {}  closed", signal_number);
+            signal4_open = false;
+        } else if ((signal_number == 5) && (signal5_open == true)) {
+            signal5_open = false;
+            spdlog::info("自动拍停关闭 signal {}  open", signal_number);
+            if(SUCCESS != request_pt("1")) {
+                request_pt("1");
+            }
         }
     }
 }
+#endif
+void get_line_val(const int& signal_number, gpiod_line* line, bool& signal_open) {
+    enum SignalState {
+        CLOSED,
+        OPEN
+    };
 
+    static SignalState signal_states[5] = {CLOSED, CLOSED, CLOSED, CLOSED, CLOSED};
+
+    auto val = gpiod_line_get_value(line);
+    if (val < 0) {
+        spdlog::error("Get signal {} status error", signal_number);
+        return;
+    }
+
+    SignalState current_state = (val == 1) ? OPEN : CLOSED;
+
+    if (signal_states[signal_number - 1] != current_state) {
+        signal_states[signal_number - 1] = current_state;
+
+        if (current_state == OPEN) {
+            switch (signal_number) {
+                case 1:
+                {
+                    signal1_open = true;
+                    spdlog::info("中控室主控箱和船端控制箱连接状态正常 signal {} open", signal_number);
+                    break;
+                }
+                case 2:
+                {
+                    signal2_open = true;
+                    spdlog::info("中控室主控箱急停按下 signal {} open", signal_number);
+                    open_fmq_alarm();
+                    spdlog::info("蜂鸣器警告记录");
+                    open_ship_alarm();
+                    spdlog::info("船端警告记录");
+
+                    if (!light_alarm_thread.joinable()) { 
+                        light_alarm_thread = std::thread(open_gpio_light);
+                        spdlog::info("Light alarm thread started.");
+                    }
+                    if (SUCCESS != request_sql("10", "10")) {
+                        request_sql("10", "10");
+                    }
+                    break;
+                }
+                case 3:
+                {
+                    signal3_open = true;
+                    spdlog::info("船端按下急停按钮 signal {} open", signal_number);
+                    open_fmq_alarm();
+                    spdlog::info("蜂鸣器警告记录");
+                    open_ship_alarm();
+                    spdlog::info("船端警告记录");
+                    if (!light_alarm_thread.joinable()) { 
+                        light_alarm_thread = std::thread(open_gpio_light);
+                        spdlog::info("Light alarm thread started.");
+                    }
+                    if (SUCCESS != request_sql("15", "10")) {
+                        request_sql("15", "10");
+                    }
+                    break;
+                }
+                case 4:
+                {
+                    signal4_open = true;
+                    spdlog::info("中控室复位 signal {} open", signal_number);
+                    close_fmq_alarm();
+                    spdlog::info("停止蜂鸣器警告记录");
+                    close_ship_alarm();
+                    spdlog::info("停止船端警告记录");
+                    blight = false;
+                    if (light_alarm_thread.joinable()) {
+                        light_alarm_thread.join(); // 等待线程结束
+                        spdlog::info("Light alarm thread joined.");
+                    }
+                    close_gpio_light();
+                    if (SUCCESS != request_sql("0", "0")) {
+                        request_sql("0", "0");
+                    }
+                    break;
+                }
+                case 5:
+                {
+                    signal5_open = true;
+                    spdlog::info("自动拍停开始 signal {} open", signal_number);
+                    if (SUCCESS != request_pt("0")) {
+                        request_pt("0");
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        } else {
+            switch (signal_number) {
+                case 1:
+                {
+                    signal1_open = false;
+                    spdlog::error("中控室主控箱和船端控制箱连接状态异常 signal {} closed", signal_number);
+                    break;
+                }
+                case 2:
+                {
+                    signal2_open = false;
+                    close_fmq_alarm();
+                    spdlog::info("停止蜂鸣器警告记录");
+                    close_ship_alarm();
+                    spdlog::info("停止船端警告记录");
+                    blight = false;
+                    if (light_alarm_thread.joinable()) {
+                        light_alarm_thread.join(); // 等待线程结束
+                        spdlog::info("Light alarm thread joined.");
+                    }
+                    close_gpio_light();
+                    spdlog::error("中控室主控箱急停关闭 signal {} closed", signal_number);
+                    break;
+                }
+                case 3:
+                {
+                    signal3_open = false;
+                    spdlog::error("船端按下急停关闭 signal {} closed", signal_number);
+                    close_fmq_alarm();
+                    spdlog::info("停止蜂鸣器警告记录");
+                    close_ship_alarm();
+                    spdlog::info("停止船端警告记录");
+                    blight = false;
+                    if (light_alarm_thread.joinable()) {
+                        light_alarm_thread.join(); // 等待线程结束
+                        spdlog::info("Light alarm thread joined.");
+                    }
+                    close_gpio_light();
+                    break;
+                }
+                case 4:
+                {
+                    signal4_open = false;
+                    spdlog::error("中控室复位关闭 signal {} closed", signal_number);
+                    break;
+                }
+                case 5:
+                {
+                    signal5_open = false;
+                    spdlog::info("自动拍停关闭 signal {} closed", signal_number);
+                    if (SUCCESS != request_pt("1")) {
+                        request_pt("1");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
 // 获取gpio状态
 int get_gpio_value() {
     if (!chip) {
@@ -482,8 +740,10 @@ int get_gpio_value() {
     gpiod_line* line_22 = gpiod_chip_get_line(chip, signal_3);
     // No.4 GPIO23
     gpiod_line* line_23 = gpiod_chip_get_line(chip, signal_4);
+    // No.5 GPIO5
+    gpiod_line* line_5 = gpiod_chip_get_line(chip, signal_5);
 
-    if (!line_17 || !line_27 || !line_22 || !line_23) {
+    if (!line_17 || !line_27 || !line_22 || !line_23 || !line_5) {
         spdlog::error("Get chip0 lines failed.");
         return FAILURE;
     }
@@ -491,9 +751,10 @@ int get_gpio_value() {
     gpiod_line_request_input(line_27, consumer);
     gpiod_line_request_input(line_22, consumer);
     gpiod_line_request_input(line_23, consumer);
+    gpiod_line_request_input(line_5, consumer);
     // 获取GPIO状态
-    bool signal_open[4] = {false};
-    gpiod_line*  signal_lines[4] = {line_17, line_27, line_22, line_23};
+    bool signal_open[5] = {false};
+    gpiod_line*  signal_lines[5] = {line_17, line_27, line_22, line_23, line_5};
 
     while (true)
     {
@@ -501,7 +762,7 @@ int get_gpio_value() {
         get_line_val(2, line_27, signal_open[1]);
         get_line_val(3, line_22, signal_open[2]);
         get_line_val(4, line_23, signal_open[3]);
-
+        get_line_val(5, line_5, signal_open[4]);
         sleep(1);
     }
 
@@ -591,7 +852,6 @@ int main(int argc, char* argv[]) {
     
     // 启动TCP服务器
     //recv_alarm();
-
     // MQTT连接
     HVMqtt mqtt;
     mqtt.init("localhost", 1883, "warnRecord");
